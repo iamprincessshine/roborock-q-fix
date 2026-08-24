@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -24,6 +25,8 @@ PLATFORMS = [Platform.IMAGE, Platform.SELECT]
 # HA's own B01 messages use msg_ids >= 100000000000 (see get_next_int in
 # python-roborock); the app/cloud uses small ids like 259704.
 _APP_MSG_ID_LIMIT = 100000000000
+# How long to wait for the device MQTT connection before giving up.
+_READY_TIMEOUT = 60
 
 
 def _parse_app_command(message: RoborockMessage) -> dict[str, Any] | None:
@@ -54,7 +57,8 @@ def _parse_app_command(message: RoborockMessage) -> dict[str, Any] | None:
 
 async def _capture_q7_app_commands(
     coordinator: RoborockB01Q7UpdateCoordinator,
-) -> Any | None:
+    unsubs: list[Any],
+) -> None:
     """Log RPC commands the Roborock app sends to the device via the cloud.
 
     The app talks to the device through Roborock's cloud on the same MQTT
@@ -64,22 +68,36 @@ async def _capture_q7_app_commands(
     the room restriction, so we capture the real payload the app sends.
     """
     try:
-        mqtt_channel = coordinator._device._channel._mqtt_channel
+        device = coordinator._device
+        mqtt_channel = device._channel._mqtt_channel
     except AttributeError:
-        return None
+        return
+
+    # The MQTT session may still be connecting during setup; subscribe only
+    # once the device is ready (the session resubscribes on reconnect).
+    ready = asyncio.Event()
+    remove_ready_callback = device.add_ready_callback(ready.set)
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
+    except asyncio.TimeoutError:
+        _LOGGER.debug("Q7 device not ready in %ss; skipping app command capture", _READY_TIMEOUT)
+        return
+    finally:
+        remove_ready_callback()
 
     def on_message(message: RoborockMessage) -> None:
         if (inner := _parse_app_command(message)) is not None:
             _LOGGER.info("Q7 APP COMMAND: %s", inner)
 
     try:
-        return await mqtt_channel._mqtt_session.subscribe(
-            mqtt_channel._publish_topic,
-            decoder_callback(mqtt_channel._decoder, on_message, _LOGGER),
+        unsubs.append(
+            await mqtt_channel._mqtt_session.subscribe(
+                mqtt_channel._publish_topic,
+                decoder_callback(mqtt_channel._decoder, on_message, _LOGGER),
+            )
         )
     except Exception:  # noqa: BLE001 - capture must never break setup
         _LOGGER.exception("Failed to subscribe to Q7 app command topic")
-        return None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -106,13 +124,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
     hass.data[DOMAIN][entry.entry_id].setdefault(CONF_MAP_ROTATION, {})
 
-    unsubs = []
+    unsubs: list[Any] = []
     for coord in coordinators:
         if isinstance(coord, RoborockB01Q7UpdateCoordinator):
-            if unsub := await _capture_q7_app_commands(coord):
-                unsubs.append(unsub)
-    if unsubs:
-        hass.data[DOMAIN][entry.entry_id]["q7_capture_unsubs"] = unsubs
+            hass.async_create_task(_capture_q7_app_commands(coord, unsubs))
+    # Same list reference: the background tasks append to it once the device
+    # is ready, and async_unload_entry drains it.
+    hass.data[DOMAIN][entry.entry_id]["q7_capture_unsubs"] = unsubs
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
