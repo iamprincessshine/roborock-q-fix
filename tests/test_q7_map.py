@@ -222,3 +222,41 @@ def test_calibration_none_without_payload():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-x"]))
+
+
+def test_parse_app_command_captures_app_payload():
+    """App commands (small msgIds) are captured, HA's own are skipped."""
+    from roborock.roborock_message import RoborockMessage, RoborockMessageProtocol
+
+    import roborock_custom_map as rcm
+
+    app_msg = RoborockMessage(
+        protocol=RoborockMessageProtocol.RPC_REQUEST,
+        version=b"B01",
+        payload=(
+            b'{"dps": {"10000": "{\\"method\\":\\"service.set_room_clean\\",'
+            b'\\"msgId\\":\\"259704\\",\\"params\\":{\\"room_ids\\":[10],\\"x\\":1}}"}}'
+        ),
+    )
+    parsed = rcm._parse_app_command(app_msg)
+    assert parsed is not None
+    assert parsed["method"] == "service.set_room_clean"
+    assert parsed["msgId"] == "259704"
+    assert parsed["params"]["room_ids"] == [10]
+
+    own_msg = RoborockMessage(
+        protocol=RoborockMessageProtocol.RPC_REQUEST,
+        version=b"B01",
+        payload=(
+            b'{"dps": {"10000": "{\\"method\\":\\"service.get_map_list\\",'
+            b'\\"msgId\\":\\"200000000037\\",\\"params\\":{}}"}}'
+        ),
+    )
+    assert rcm._parse_app_command(own_msg) is None
+
+    not_rpc = RoborockMessage(
+        protocol=RoborockMessageProtocol.RPC_RESPONSE,
+        version=b"B01",
+        payload=b'{"dps": {}}',
+    )
+    assert rcm._parse_app_command(not_rpc) is None
