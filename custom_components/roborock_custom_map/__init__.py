@@ -25,8 +25,10 @@ PLATFORMS = [Platform.IMAGE, Platform.SELECT]
 # HA's own B01 messages use msg_ids >= 100000000000 (see get_next_int in
 # python-roborock); the app/cloud uses small ids like 259704.
 _APP_MSG_ID_LIMIT = 100000000000
-# How long to wait for the device MQTT connection before giving up.
-_READY_TIMEOUT = 60
+# The Roborock broker can be flaky at subscribe time (device MQTT drops);
+# retry until it sticks.
+_SUBSCRIBE_ATTEMPTS = 12
+_SUBSCRIBE_RETRY_DELAY = 15
 
 
 def _parse_app_command(message: RoborockMessage) -> dict[str, Any] | None:
@@ -73,31 +75,22 @@ async def _capture_q7_app_commands(
     except AttributeError:
         return
 
-    # The MQTT session may still be connecting during setup; subscribe only
-    # once the device is ready (the session resubscribes on reconnect).
-    ready = asyncio.Event()
-    remove_ready_callback = device.add_ready_callback(ready.set)
-    try:
-        await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
-    except asyncio.TimeoutError:
-        _LOGGER.debug("Q7 device not ready in %ss; skipping app command capture", _READY_TIMEOUT)
-        return
-    finally:
-        remove_ready_callback()
-
     def on_message(message: RoborockMessage) -> None:
         if (inner := _parse_app_command(message)) is not None:
             _LOGGER.info("Q7 APP COMMAND: %s", inner)
 
-    try:
-        unsubs.append(
-            await mqtt_channel._mqtt_session.subscribe(
-                mqtt_channel._publish_topic,
-                decoder_callback(mqtt_channel._decoder, on_message, _LOGGER),
-            )
-        )
-    except Exception:  # noqa: BLE001 - capture must never break setup
-        _LOGGER.exception("Failed to subscribe to Q7 app command topic")
+    subscribe = mqtt_channel._mqtt_session.subscribe
+    topic = mqtt_channel._publish_topic
+    callback = decoder_callback(mqtt_channel._decoder, on_message, _LOGGER)
+    for attempt in range(1, _SUBSCRIBE_ATTEMPTS + 1):
+        try:
+            unsubs.append(await subscribe(topic, callback))
+            _LOGGER.info("Q7 app command capture subscribed to %s", topic)
+            return
+        except Exception as err:  # noqa: BLE001 - retry transient broker issues
+            _LOGGER.debug("Q7 capture subscribe attempt %s/%s failed: %s", attempt, _SUBSCRIBE_ATTEMPTS, err)
+            await asyncio.sleep(_SUBSCRIBE_RETRY_DELAY)
+    _LOGGER.warning("Q7 app command capture: gave up after %s attempts", _SUBSCRIBE_ATTEMPTS)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
